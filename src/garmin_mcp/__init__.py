@@ -1,12 +1,13 @@
 import base64
 import datetime
+import json
 import logging
 import os
 import sys
 
 import anyio
 import uvicorn
-from garminconnect import Garmin, GarminConnectAuthenticationError
+from garminconnect import Garmin
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.fastmcp import FastMCP
 from pydantic import AnyHttpUrl
@@ -29,6 +30,7 @@ from garmin_mcp import (
     workouts,
 )
 from garmin_mcp.github_oauth_provider import GitHubOAuthProvider
+from garmin_mcp.garmin_session import GarminSessionError, load_garmin_session
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -104,66 +106,26 @@ def _build_app() -> tuple[FastMCP, GitHubOAuthProvider]:
 
 def _log_token_expiry(garmin: Garmin) -> None:
     try:
-        auth = getattr(garmin, 'garth', None) or getattr(garmin, 'client', None)
-        # Some versions nest the oauth2 token under auth.garth
-        if auth is not None and not hasattr(auth, 'oauth2_token'):
-            auth = getattr(auth, 'garth', auth)
-        token = auth.oauth2_token
+        # Diagnostic only: the JWT exp belongs to the ACCESS token, not the
+        # refresh token. garminconnect 0.3.6 does not expose refresh expiry.
+        payload = garmin.client.di_token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
         expires_at = datetime.datetime.fromtimestamp(
-            token.refresh_token_expires_at, tz=datetime.timezone.utc
+            claims["exp"], tz=datetime.timezone.utc
         )
-        days_left = (expires_at - datetime.datetime.now(datetime.timezone.utc)).days
-        if token.refresh_expired:
-            logger.error("Garmin refresh token has EXPIRED — all API calls will fail. Regenerate GARMINTOKENS_BASE64.")
-        elif days_left <= 14:
-            logger.warning("Garmin refresh token expires in %d day(s) on %s — regenerate GARMINTOKENS_BASE64 soon.", days_left, expires_at.date())
-        else:
-            logger.info("Garmin refresh token valid until %s (%d days).", expires_at.date(), days_left)
+        logger.info("Garmin access token expiry: %s; automatic refresh enabled.", expires_at.isoformat())
     except Exception:
-        pass
+        logger.info("Garmin access token expiry unavailable; automatic refresh enabled.")
 
 
 def init_api() -> Garmin:
-    b64 = os.getenv("GARMINTOKENS_BASE64")
-    if b64:
-        logger.info("Trying to login to Garmin Connect using token from environment...")
-        token_json = base64.b64decode(b64).decode("utf-8")
-        garmin = Garmin(is_cn=is_cn)
-        try:
-            garmin.login(token_json)
-        except GarminConnectAuthenticationError as e:
-            logger.error(
-                "Garmin token is expired or invalid (%s). "
-                "Regenerate GARMINTOKENS_BASE64 using: garmin-mcp-auth",
-                e,
-            )
-            sys.exit(1)
-        _log_token_expiry(garmin)
-        logger.info("Login successful using GARMINTOKENS_BASE64.")
-        return garmin
-
-    local = os.path.expanduser("~/.garminconnect")
-    if os.path.isdir(local):
-        logger.info("Using local token files from %s", local)
-        garmin = Garmin(is_cn=is_cn)
-        try:
-            garmin.login(local)
-        except GarminConnectAuthenticationError as e:
-            logger.error(
-                "Garmin token is expired or invalid (%s). "
-                "Regenerate tokens using: garmin-mcp-auth",
-                e,
-            )
-            sys.exit(1)
-        _log_token_expiry(garmin)
-        logger.info("Garmin Connect client initialized successfully.")
-        return garmin
-
-    logger.error(
-        "No Garmin credentials found. "
-        "Set GARMINTOKENS_BASE64 in Render Environment Variables."
-    )
-    sys.exit(1)
+    try:
+        garmin = load_garmin_session(is_cn=is_cn)
+    except GarminSessionError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
+    _log_token_expiry(garmin)
+    return garmin
 
 
 async def _serve(mcp_app: FastMCP) -> None:

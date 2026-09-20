@@ -70,7 +70,8 @@ Run `generate_token.py` locally to obtain your `GARMINTOKENS_BASE64`.
 
 > **Important:** You must run this from inside the project folder, and you must
 > use `uv run` — not `python3`. `uv run` uses the project's own virtual
-> environment, which installs the exact same library versions as your deployment.
+> environment. Garmin is pinned to `garminconnect==0.3.6` in both environments
+> and requires Python 3.12 or newer; other dependencies can still differ.
 > Using `python3` directly may use a different version on your machine, producing
 > a token format the server can't read.
 
@@ -108,7 +109,7 @@ In your MCP-compatible AI assistant, add this server as a remote MCP connection:
 
 | Env var | Required | Rotates | Description |
 |---|---|---|---|
-| `GARMINTOKENS_BASE64` | ✅ | ~90 days | Garmin OAuth session token (from `generate_token.py`) |
+| `GARMINTOKENS_BASE64` | Initial bootstrap only | — | Garmin session from `generate_token.py`; used only when Redis has no Garmin session |
 | `GITHUB_CLIENT_ID` | ✅ | Never | GitHub OAuth App client ID |
 | `GITHUB_CLIENT_SECRET` | ✅ | Never | GitHub OAuth App client secret |
 | `GITHUB_ALLOWED_USER_ID` | ✅ | Never | Immutable numeric GitHub user ID allowed to connect (preferred) |
@@ -118,18 +119,29 @@ In your MCP-compatible AI assistant, add this server as a remote MCP connection:
 | `UPSTASH_REDIS_REST_TOKEN` | ✅ | Never | Redis auth token |
 | `GARMIN_IS_CN` | — | — | Set `true` for Garmin Connect China |
 
-## Garmin token renewal (~every 90 days)
+## Garmin session persistence and recovery
 
-The server logs the exact token expiry date at every startup. Check your hosting
-platform's logs for lines like:
+Redis is required and is the primary Garmin session store. The separate key
+`mcp:garmin:session` contains only `di_token`, `di_refresh_token` and `di_client_id`,
+never your Garmin username, password or MFA code. `TOKEN_STORE_KEY` continues to
+control only GitHub/MCP OAuth storage.
 
-```
-Garmin refresh token valid until 2026-08-15 (84 days).
-Garmin refresh token expires in 12 day(s) on 2026-06-03 — regenerate GARMINTOKENS_BASE64 soon.
-Garmin refresh token has EXPIRED — all API calls will fail. Regenerate GARMINTOKENS_BASE64.
-```
+When the Garmin key is absent, the server bootstraps from `GARMINTOKENS_BASE64`
+and persists the session. Subsequent restarts use Redis, even if the environment
+still contains an older bootstrap token. Garmin refreshes automatically on API
+use; each successful refresh is saved immediately. There is no background
+keepalive or guaranteed refresh-token lifetime. Startup logs describe the
+access-token expiry, not the refresh-token expiry.
 
-When the token needs renewal:
+Redis read errors or corrupt sessions stop startup without falling back to the
+bootstrap token. A failed write after refresh is reported; the renewed session
+remains in memory and saving is retried before the next Garmin API request,
+even if the access token does not need refreshing. If Redis still fails, that
+request is not sent; a persistence failure never replays a Garmin operation. Restarting
+before that write succeeds can still lose the renewed tokens. This integration
+assumes one instance and does not coordinate concurrent deployments or workers.
+
+If Garmin revokes or expires the stored session, generate a new bootstrap locally:
 
 ```bash
 cd /path/to/garmin-connect-mcp   # must be in this folder
@@ -138,8 +150,11 @@ cd /path/to/garmin-connect-mcp   # must be in this folder
 
 1. Open the generated `token.txt`, select all, copy
 2. Update `GARMINTOKENS_BASE64` on your hosting platform
-3. Trigger a redeploy
-4. Delete `token.txt`
+3. Stop the service and delete **only** `mcp:garmin:session` from Redis so the new
+   bootstrap will be used. Do not delete the GitHub/MCP OAuth key.
+4. Start/redeploy the service and confirm the session was persisted in Redis
+5. Delete `token.txt`; the bootstrap environment variable can also be removed
+   after successful persistence
 
 Your AI assistant's configuration and GitHub OAuth are **not** affected.
 
@@ -150,7 +165,7 @@ Your AI assistant's configuration and GitHub OAuth are **not** affected.
 - **User restriction:** GitHub user ID verified against `GITHUB_ALLOWED_USER_ID` on every login (immutable; `GITHUB_ALLOWED_USER` is a legacy username fallback)
 - **Token lifetime:** 30-day access token, 30-day refresh token (rotated on each refresh)
 - **Token persistence:** Redis-compatible store — tokens survive container restarts
-- **Garmin auth:** OAuth via `garminconnect` ≥ 0.3.2, widget+cffi strategy
+- **Garmin auth:** `garminconnect==0.3.6`, automatic DI token refresh, separate Redis session
 
 ## Contributing
 
